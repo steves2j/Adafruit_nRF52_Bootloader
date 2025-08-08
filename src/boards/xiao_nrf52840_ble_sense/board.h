@@ -65,4 +65,11 @@
 #define UF2_BOARD_ID       "nRF52840-SeeedXiaoSense-v1"
 #define UF2_INDEX_URL      "https://www.seeedstudio.com/"
 
+#define BANK0_ADDR  0x27000u   /* example start of bank 0 */
+#define BANK1_ADDR  0x8D000u   /* example start of bank 1 */
+#define DFU_TOTAL   (BOOTLOADER_REGION_START - BANK0_ADDR)
+#define BANK_SIZE   (DFU_TOTAL / 2)
+#define BANK_SETTINGS_ADDR 0xF0000u
+
+
 #endif // _XIAO_BLE_SENSE

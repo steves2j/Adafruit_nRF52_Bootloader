@@ -47,6 +47,7 @@ typedef struct
     uint16_t bank_0;          /**< Variable to store if bank 0 contains a valid application. */
     uint16_t bank_0_crc;      /**< If bank is valid, this field will contain a valid CRC of the total image. */
     uint16_t bank_1;          /**< Variable to store if bank 1 has been erased/prepared for new image. Bank 1 is only used in Banked Update scenario. */
+    uint16_t active_bank;
     uint32_t bank_0_size;     /**< Size of active image in bank0 if present, otherwise 0. */
     uint32_t sd_image_size;   /**< Size of SoftDevice image in bank0 if bank_0 code is BANK_VALID_SD. */
     uint32_t bl_image_size;   /**< Size of Bootloader image in bank0 if bank_0 code is BANK_VALID_SD. */

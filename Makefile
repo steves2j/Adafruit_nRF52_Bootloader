@@ -142,6 +142,7 @@ C_SRC += \
   src/main.c \
   src/screen.c \
   src/images.c \
+  src/bank_settings.c \
 
 # all files in boards
 C_SRC += src/boards/boards.c
@@ -293,7 +294,7 @@ CFLAGS += \
 	-Wunreachable-code
 
 # Suppress warning caused by SDK
-CFLAGS += -Wno-unused-parameter -Wno-expansion-to-defined
+CFLAGS += -Wno-unused-parameter -Wno-expansion-to-defined -Wno-deprecated
 
 # Nordic Softdevice SDK header files contains inline assembler that has
 # broken constraints. As a result the IPA-modref pass, introduced in gcc-11,

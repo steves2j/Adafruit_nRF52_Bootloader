@@ -71,3 +71,12 @@ void flash_nrf5x_write (uint32_t dst, void const *src, int len, bool need_erase)
   memcpy(_fl_buf + (dst & (FLASH_PAGE_SIZE - 1)), src, len);
 }
 
+void flash_read(uint32_t address, uint8_t* buffer, uint32_t length)
+{
+    memcpy(buffer, (void const *)address, length);
+}
+
+void flash_page_erase(uint32_t page_address)
+{
+    nrfx_nvmc_page_erase(page_address);
+}

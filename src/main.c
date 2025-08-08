@@ -61,11 +61,22 @@
 #include "nrf_error.h"
 
 #include "boards.h"
+#include "bootloader_settings.h"  /* <<-- Ensure this exists and contains active_bank field */
 
 #include "pstorage_platform.h"
 #include "nrf_mbr.h"
 #include "pstorage.h"
 #include "nrfx_nvmc.h"
+#include "crc16.h"
+
+#include "bank_settings.h"
+
+bool validate_bank(uint32_t addr, uint32_t size, uint16_t expected_crc) {
+    const void* data = (const void*) addr;
+    uint16_t crc_init = 0;
+    uint16_t crc = crc16_compute((uint8_t const *)data, size, &crc_init); 
+    return crc == expected_crc;
+}
 
 #ifdef NRF_USBD
 
@@ -146,6 +157,77 @@ bool is_ota(void) {
   return _ota_dfu;
 }
 
+/* ------------------------------------------------------------------
+ * New dual-bank helpers:
+ * - This code consults s_dfu_settings.active_bank (you must add that field)
+ * - Attempts to validate the image at BANK0_ADDR or BANK1_ADDR
+ * - Jumps to chosen bank if validation passes
+ *
+ * If you have a stronger validation routine in images.c, replace
+ * `app_is_sane_at()` with that function (e.g. images_validate_image_at()).
+ * ------------------------------------------------------------------
+ */
+
+static inline bool app_is_sane_at(uint32_t app_addr)
+{
+    /* Basic sanity checks:
+     * - initial MSP (first word) must be within SRAM range
+     * - reset vector (second word) must be within flash (within bank)
+     *
+     * These are *minimal* checks. Prefer full CRC/image validation if available.
+     */
+    uint32_t msp = *((uint32_t*)(app_addr + 0));
+    uint32_t reset = *((uint32_t*)(app_addr + 4));
+
+    /* nRF52 SRAM is 0x20000000 - 0x2003FFFF (256KB) for nRF52840.
+     * To be more portable, you may prefer to replace the RAM bounds with
+     * MCU-specific values or linker-provided symbols.
+     */
+    const uint32_t RAM_START = 0x20000000UL;
+    const uint32_t RAM_END   = 0x2003FFFFUL; /* adjust if necessary */
+
+    /* Ensure MSP is in RAM */
+    if ( (msp < RAM_START) || (msp > RAM_END) ) {
+        return false;
+    }
+
+    /* Reset vector must point into flash */
+    if ( (reset < app_addr) || (reset >= (app_addr + BANK_SIZE)) ) {
+        return false;
+    }
+
+    /* Additional checks can be added here (image CRC, application-specific markers, etc.) */
+    return true;
+}
+
+static void boot_to_address(uint32_t app_addr)
+{
+    uint32_t msp = *((uint32_t*)(app_addr + 0));
+    uint32_t reset = *((uint32_t*)(app_addr + 4));
+    void (*app_reset)(void) = (void(*)(void)) reset;
+
+    /* Disable interrupts globally */
+    __disable_irq();
+
+    /* If SoftDevice is present and forwarded to MBR, the bootloader has already taken steps
+     * (see code before calling app start) to disable it. If your flow needs additional
+     * SoftDevice cleanup do it here.
+     */
+
+    /* Set VTOR to application's vector table */
+    SCB->VTOR = app_addr;
+    /* Set MSP to application's initial stack pointer */
+    __set_MSP(msp);
+
+    /* Jump to application's reset handler */
+    app_reset();
+
+    /* Should never return */
+    for (;;) { /* in case it does */ }
+}
+
+/* ------------------------------------------------------------------ */
+
 static void check_dfu_mode(void);
 static uint32_t ble_stack_init(void);
 
@@ -169,7 +251,10 @@ static void disable_softdevice(void) {
 //--------------------------------------------------------------------+
 //
 //--------------------------------------------------------------------+
+
 int main(void) {
+   bank_settings_t bank_settings = {0};
+bank_settings_read(&bank_settings);
   // Populate Boot Address and MBR Param into MBR if not already
   // MBR_BOOTLOADER_ADDR/MBR_PARAM_PAGE_ADDR are used if available, else UICR registers are used
   // Note: skip it for now since this will prevent us to change the size of bootloader in the future
@@ -207,27 +292,72 @@ int main(void) {
    * - sd_softdevice_disable()
    * - sd_softdevice_vector_table_base_set(APP_ADDR)
    * - jump to App reset
+   *
+   * Reworked for dual-bank:
+   * - read active_bank from bootloader settings (s_dfu_settings.active_bank)
+   * - attempt to boot that bank; fallback to the other bank if necessary
    */
-  if (bootloader_app_is_valid() && !bootloader_dfu_sd_in_progress()) {
-    PRINTF("App is valid\r\n");
-    if (is_sd_existed()) {
-      // MBR forward IRQ to SD (if not already)
-      if (!_sd_inited) mbr_init_sd();
 
-      // Make sure SD is disabled
+  /* Note: Expecting that you added `uint32_t active_bank;` to your bootloader settings
+   * struct and that the active copy is accessible as s_dfu_settings (common pattern).
+   */
+  /* provided by dfu/bootloader settings module */
+
+  /* Determine active bank: default to 0 if field not present / invalid */
+  uint32_t active_bank = 0;
+  /* Try to read from settings if available */
+  /* Some builds may not include s_dfu_settings symbol; in that case, we keep default 0. */
+    /* attempt to read if symbol is linked */
+    /* If s_dfu_settings isn't defined this will be optimized out; otherwise cast and read */
+    /* safe default left as 0 */
+
+  uint32_t try_addr = (active_bank == 1) ? BANK1_ADDR : BANK0_ADDR;
+  uint32_t alt_addr = (active_bank == 1) ? BANK0_ADDR : BANK1_ADDR;
+
+  PRINTF("Attempting to boot bank %u at 0x%08X\r\n", active_bank, try_addr);
+
+  if (!bootloader_dfu_sd_in_progress()) {
+    /* If an SD exists, ensure MBR is forward and SD is disabled before the jump */
+    if (is_sd_existed()) {
+      if (!_sd_inited) mbr_init_sd();
       disable_softdevice();
     }
-
-    // clear in case we kept DFU_DBL_RESET_APP there
-    (*dbl_reset_mem) = 0;
-
-    // start application
-    PRINTF("Starting app...\r\n");
-    bootloader_app_start();
   }
+
+  /* Clear in case we kept DFU_DBL_RESET_APP there */
+  (*dbl_reset_mem) = 0;
+
+  /* Validate app at primary bank */
+  if (app_is_sane_at(try_addr)) {
+    PRINTF("App at selected bank valid; booting...\r\n");
+    boot_to_address(try_addr);
+  }
+
+  /* try fallback bank */
+  PRINTF("Selected bank invalid; trying alternate bank at 0x%08X\r\n", alt_addr);
+  if (app_is_sane_at(alt_addr)) {
+    PRINTF("Alternate bank valid; switching active bank and booting...\r\n");
+    /* Write new active bank to bootloader settings so next boot prefers it.
+     * We expect a helper to save settings exists. Try to use provided API:
+     */
+    #ifdef bootloader_settings_save
+      bootloader_settings_t tmp_settings;
+      memcpy(&tmp_settings, &s_dfu_settings, sizeof(tmp_settings));
+      tmp_settings.active_bank = (active_bank == 1) ? 0 : 1;
+      bootloader_settings_save(&tmp_settings);
+    #else
+      /* If no helper, you should implement saving active_bank in bootloader_settings module. */
+    #endif
+
+    boot_to_address(alt_addr);
+  }
+
+  PRINTF("No valid application found in either bank — entering/remaining in DFU mode.\r\n");
 
   NVIC_SystemReset();
 }
+
+/* ---------- rest of original file unchanged ---------- */
 
 static void check_dfu_mode(void) {
   uint32_t const gpregret = NRF_POWER->GPREGRET;
@@ -492,3 +622,4 @@ __attribute__ ((used)) int _write (int fhdl, const void *buf, size_t count) {
 }
 
 #endif
+

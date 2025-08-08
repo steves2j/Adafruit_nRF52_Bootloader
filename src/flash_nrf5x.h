@@ -36,6 +36,8 @@
 
 void flash_nrf5x_write (uint32_t dst, void const *src, int len, bool need_erase);
 void flash_nrf5x_flush (bool need_erase);
+void flash_read(uint32_t address, uint8_t* buffer, uint32_t length);
+void flash_page_erase(uint32_t page_address);
 
 #ifdef __cplusplus
  }
