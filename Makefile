@@ -142,7 +142,6 @@ C_SRC += \
   src/main.c \
   src/screen.c \
   src/images.c \
-  src/bank_settings.c \
 
 # all files in boards
 C_SRC += src/boards/boards.c
