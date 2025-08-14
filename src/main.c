@@ -33,6 +33,7 @@
  * -# Activate Image, boot application.
  *
  */
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -61,23 +62,80 @@
 #include "nrf_error.h"
 
 #include "boards.h"
-#include "bootloader_settings.h"  /* <<-- Ensure this exists and contains active_bank field */
 
 #include "pstorage_platform.h"
 #include "nrf_mbr.h"
+#include "nrf_sdm.h"
 #include "pstorage.h"
 #include "nrfx_nvmc.h"
-#include "crc16.h"
 
-#include "bank_settings.h"
 
-bool validate_bank(uint32_t addr, uint32_t size, uint16_t expected_crc) {
-    const void* data = (const void*) addr;
-    uint16_t crc_init = 0;
-    uint16_t crc = crc16_compute((uint8_t const *)data, size, &crc_init); 
-    return crc == expected_crc;
+/* ----- Dual-bank selection additions ------------------------------------ */
+
+// Fixed app bank layout for XIAO nRF52840 BLE (from linker files)
+#define APP_BANK0_ADDR   (0x00027000u)
+#define APP_BANK1_ADDR   (0x00088000u)
+#define APP_BANK_SIZE    (0x00061000u)
+_Static_assert(APP_BANK0_ADDR + APP_BANK_SIZE == APP_BANK1_ADDR, "Bank layout mismatch");
+
+// Persistent bank-select page (one 4KB page right before bootloader start: 0xE9000–0xEA000)
+#define BOOTLOADER_START (0x000EA000u)
+#define BANK_CFG_PAGE_ADDR  (BOOTLOADER_START - 0x1000u)
+#define BANK_CFG_MAGIC      (0x42414E4Bu) /* 'BANK' */
+#define BANK_CFG_RESERVED   (0xFFFFFFFFu) /* Reserved fields default to erased value */
+typedef struct {
+  uint32_t magic;        // BANK_CFG_MAGIC
+  uint32_t active_bank;  // 0 or 1
+  uint32_t reserved0;    // reserved for future use
+  uint32_t reserved1;    // reserved for future use
+} bank_cfg_t;
+
+static inline bool word_in_range(uint32_t w, uint32_t lo, uint32_t hi_exclusive) {
+  return (w >= lo) && (w < hi_exclusive);
 }
 
+// Basic vector-table sanity: MSP points to SRAM, Reset points into chosen bank (Thumb)
+static bool app_vectors_look_sane(uint32_t app_addr) {
+  uint32_t const msp   = *((uint32_t const*)(app_addr + 0));
+  uint32_t const reset = *((uint32_t const*)(app_addr + 4));
+  bool ok_msp   = word_in_range(msp, 0x20000000u, 0x20040000u + 1u) && ((msp & 7u) == 0);
+  if (!ok_msp) PRINTF("MSP[0x%08lX] pointer failed 0x%08lX\r\n",(unsigned long) app_addr,(unsigned long) msp);
+  bool ok_reset = word_in_range(reset & ~1u, app_addr, app_addr + APP_BANK_SIZE) && ((reset & 1u) == 1u);
+  if (!ok_reset) PRINTF("RESET[0x%08lX] pointer failed 0x%08lX\r\n",(unsigned long) app_addr,(unsigned long) reset);
+  return ok_msp && ok_reset;
+}
+
+// Read persistent setting; return 0, 1, or -1 if unset/invalid
+static int read_active_bank_setting(void) {
+  bank_cfg_t const* cfg = (bank_cfg_t const*) BANK_CFG_PAGE_ADDR;
+  if (cfg->magic == BANK_CFG_MAGIC) {
+    return (cfg->active_bank & 1u);
+  }
+  return -1;
+}
+
+// Write active bank setting (erases the entire page first)
+static uint32_t write_active_bank_setting(uint32_t bank) {
+  if (bank > 1) return NRF_ERROR_INVALID_PARAM;
+
+  // Erase the config page
+  nrfx_nvmc_page_erase(BANK_CFG_PAGE_ADDR);
+
+  // Prepare config struct
+  bank_cfg_t cfg = {
+    .magic = BANK_CFG_MAGIC,
+    .active_bank = bank,
+    .reserved0 = BANK_CFG_RESERVED,
+    .reserved1 = BANK_CFG_RESERVED
+  };
+
+  // Write the struct (assumes page is erased)
+  nrfx_nvmc_bytes_write(BANK_CFG_PAGE_ADDR, (uint8_t*)&cfg, sizeof(cfg));
+
+  return NRF_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------ */
 #ifdef NRF_USBD
 
 #include "uf2/uf2.h"
@@ -157,78 +215,7 @@ bool is_ota(void) {
   return _ota_dfu;
 }
 
-/* ------------------------------------------------------------------
- * New dual-bank helpers:
- * - This code consults s_dfu_settings.active_bank (you must add that field)
- * - Attempts to validate the image at BANK0_ADDR or BANK1_ADDR
- * - Jumps to chosen bank if validation passes
- *
- * If you have a stronger validation routine in images.c, replace
- * `app_is_sane_at()` with that function (e.g. images_validate_image_at()).
- * ------------------------------------------------------------------
- */
-
-static inline bool app_is_sane_at(uint32_t app_addr)
-{
-    /* Basic sanity checks:
-     * - initial MSP (first word) must be within SRAM range
-     * - reset vector (second word) must be within flash (within bank)
-     *
-     * These are *minimal* checks. Prefer full CRC/image validation if available.
-     */
-    uint32_t msp = *((uint32_t*)(app_addr + 0));
-    uint32_t reset = *((uint32_t*)(app_addr + 4));
-
-    /* nRF52 SRAM is 0x20000000 - 0x2003FFFF (256KB) for nRF52840.
-     * To be more portable, you may prefer to replace the RAM bounds with
-     * MCU-specific values or linker-provided symbols.
-     */
-    const uint32_t RAM_START = 0x20000000UL;
-    const uint32_t RAM_END   = 0x2003FFFFUL; /* adjust if necessary */
-
-    /* Ensure MSP is in RAM */
-    if ( (msp < RAM_START) || (msp > RAM_END) ) {
-        return false;
-    }
-
-    /* Reset vector must point into flash */
-    if ( (reset < app_addr) || (reset >= (app_addr + BANK_SIZE)) ) {
-        return false;
-    }
-
-    /* Additional checks can be added here (image CRC, application-specific markers, etc.) */
-    return true;
-}
-
-static void boot_to_address(uint32_t app_addr)
-{
-    uint32_t msp = *((uint32_t*)(app_addr + 0));
-    uint32_t reset = *((uint32_t*)(app_addr + 4));
-    void (*app_reset)(void) = (void(*)(void)) reset;
-
-    /* Disable interrupts globally */
-    __disable_irq();
-
-    /* If SoftDevice is present and forwarded to MBR, the bootloader has already taken steps
-     * (see code before calling app start) to disable it. If your flow needs additional
-     * SoftDevice cleanup do it here.
-     */
-
-    /* Set VTOR to application's vector table */
-    SCB->VTOR = app_addr;
-    /* Set MSP to application's initial stack pointer */
-    __set_MSP(msp);
-
-    /* Jump to application's reset handler */
-    app_reset();
-
-    /* Should never return */
-    for (;;) { /* in case it does */ }
-}
-
-/* ------------------------------------------------------------------ */
-
-static void check_dfu_mode(void);
+static uint32_t check_dfu_mode(void);
 static uint32_t ble_stack_init(void);
 
 // The SoftDevice must only be initialized if a chip reset has occurred.
@@ -248,13 +235,7 @@ static void disable_softdevice(void) {
   }
 }
 
-//--------------------------------------------------------------------+
-//
-//--------------------------------------------------------------------+
-
 int main(void) {
-   bank_settings_t bank_settings = {0};
-bank_settings_read(&bank_settings);
   // Populate Boot Address and MBR Param into MBR if not already
   // MBR_BOOTLOADER_ADDR/MBR_PARAM_PAGE_ADDR are used if available, else UICR registers are used
   // Note: skip it for now since this will prevent us to change the size of bootloader in the future
@@ -281,10 +262,36 @@ bank_settings_read(&bank_settings);
 
   // Check all inputs and enter DFU if needed
   // Return when DFU process is complete (or not entered at all)
-  check_dfu_mode();
+  uint32_t dfuMode=check_dfu_mode();
+  PRINTF("DFUMode 0x%08lX\r\n",(unsigned long)dfuMode);
+  if (!dfuMode) {
+    write_active_bank_setting(0);
+    PRINTF("Clearing active bank to 0");
+  }
 
   // Reset peripherals
   board_teardown();
+
+  int active_bank = read_active_bank_setting();
+  if (active_bank < 0) {
+    active_bank = 1;  // Default to bank 0 if unset/invalid
+    PRINTF("settings unset. Defaulting to bank 0\r\n");
+  } else {
+    PRINTF("Looking at bank %d\r\n", active_bank);
+  }
+  uint32_t want  = (active_bank ? APP_BANK1_ADDR : APP_BANK0_ADDR);
+  uint32_t other = (active_bank ? APP_BANK0_ADDR : APP_BANK1_ADDR);
+
+  uint32_t app_addr = 0;
+  if (app_vectors_look_sane(want)) {
+    app_addr=want;
+    PRINTF("Using addr 0x%08lX\r\n", (unsigned long) app_addr);
+  } else if (app_vectors_look_sane(other)) {
+    app_addr=other;
+    PRINTF("Using addr 0x%08lX\r\n", (unsigned long) app_addr);
+  } else {
+    PRINTF("No sane app found\r\n");
+  }
 
   /* Jump to application if valid
    * "Master Boot Record and SoftDevice initializaton procedure"
@@ -292,76 +299,35 @@ bank_settings_read(&bank_settings);
    * - sd_softdevice_disable()
    * - sd_softdevice_vector_table_base_set(APP_ADDR)
    * - jump to App reset
-   *
-   * Reworked for dual-bank:
-   * - read active_bank from bootloader settings (s_dfu_settings.active_bank)
-   * - attempt to boot that bank; fallback to the other bank if necessary
    */
-
-  /* Note: Expecting that you added `uint32_t active_bank;` to your bootloader settings
-   * struct and that the active copy is accessible as s_dfu_settings (common pattern).
-   */
-  /* provided by dfu/bootloader settings module */
-
-  /* Determine active bank: default to 0 if field not present / invalid */
-  uint32_t active_bank = 0;
-  /* Try to read from settings if available */
-  /* Some builds may not include s_dfu_settings symbol; in that case, we keep default 0. */
-    /* attempt to read if symbol is linked */
-    /* If s_dfu_settings isn't defined this will be optimized out; otherwise cast and read */
-    /* safe default left as 0 */
-
-  uint32_t try_addr = (active_bank == 1) ? BANK1_ADDR : BANK0_ADDR;
-  uint32_t alt_addr = (active_bank == 1) ? BANK0_ADDR : BANK1_ADDR;
-
-  PRINTF("Attempting to boot bank %u at 0x%08X\r\n", active_bank, try_addr);
-
-  if (!bootloader_dfu_sd_in_progress()) {
-    /* If an SD exists, ensure MBR is forward and SD is disabled before the jump */
+  if (app_addr && !bootloader_dfu_sd_in_progress()) {
+    PRINTF("App is valid\r\n");
     if (is_sd_existed()) {
+      // MBR forward IRQ to SD (if not already)
       if (!_sd_inited) mbr_init_sd();
+
+      // Make sure SD is disabled
       disable_softdevice();
     }
+
+    // clear in case we kept DFU_DBL_RESET_APP there
+    (*dbl_reset_mem) = 0;
+
+    // start application
+    PRINTF("Starting app...\r\n");
+    NVIC->ICER[0]=0xFFFFFFFF;
+    NVIC->ICPR[0]=0xFFFFFFFF;
+    sd_softdevice_vector_table_base_set(app_addr);
+    bootloader_util_app_start(app_addr);
+    //bootloader_app_start();
   }
-
-  /* Clear in case we kept DFU_DBL_RESET_APP there */
-  (*dbl_reset_mem) = 0;
-
-  /* Validate app at primary bank */
-  if (app_is_sane_at(try_addr)) {
-    PRINTF("App at selected bank valid; booting...\r\n");
-    boot_to_address(try_addr);
-  }
-
-  /* try fallback bank */
-  PRINTF("Selected bank invalid; trying alternate bank at 0x%08X\r\n", alt_addr);
-  if (app_is_sane_at(alt_addr)) {
-    PRINTF("Alternate bank valid; switching active bank and booting...\r\n");
-    /* Write new active bank to bootloader settings so next boot prefers it.
-     * We expect a helper to save settings exists. Try to use provided API:
-     */
-    #ifdef bootloader_settings_save
-      bootloader_settings_t tmp_settings;
-      memcpy(&tmp_settings, &s_dfu_settings, sizeof(tmp_settings));
-      tmp_settings.active_bank = (active_bank == 1) ? 0 : 1;
-      bootloader_settings_save(&tmp_settings);
-    #else
-      /* If no helper, you should implement saving active_bank in bootloader_settings module. */
-    #endif
-
-    boot_to_address(alt_addr);
-  }
-
-  PRINTF("No valid application found in either bank — entering/remaining in DFU mode.\r\n");
 
   NVIC_SystemReset();
 }
 
-/* ---------- rest of original file unchanged ---------- */
-
-static void check_dfu_mode(void) {
+static uint32_t check_dfu_mode(void) {
   uint32_t const gpregret = NRF_POWER->GPREGRET;
-
+  uint32_t rtnValue = 0xff;
   // SD is already Initialized in case of BOOTLOADER_DFU_OTA_MAGIC
   _sd_inited = (gpregret == DFU_MAGIC_OTA_APPJUM);
 
@@ -383,7 +349,7 @@ static void check_dfu_mode(void) {
   if (dfu_start || dfu_skip) NRF_POWER->GPREGRET = 0;
 
   // skip dfu entirely
-  if (dfu_skip) return;
+  if (dfu_skip) return 0xff;
 
   /*------------- Determine DFU mode (Serial, OTA, FRESET or normal) -------------*/
   // DFU button pressed
@@ -439,10 +405,10 @@ static void check_dfu_mode(void) {
     // Initiate an update of the firmware.
     if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu) {
       // If USB is not enumerated in 3s (eg. because we're running on battery), we restart into app.
-      bootloader_dfu_start(_ota_dfu, 3000, true);
+      rtnValue=bootloader_dfu_start(_ota_dfu, 3000, true);
     } else {
       // No timeout if bootloader requires user action (double-reset).
-      bootloader_dfu_start(_ota_dfu, 0, false);
+      rtnValue=bootloader_dfu_start(_ota_dfu, 0, false);
     }
 
     if (_ota_dfu) {
@@ -451,6 +417,7 @@ static void check_dfu_mode(void) {
       usb_teardown();
     }
   }
+  return rtnValue;
 }
 
 // Initializes the SoftDevice by following SD specs section
@@ -623,3 +590,19 @@ __attribute__ ((used)) int _write (int fhdl, const void *buf, size_t count) {
 
 #endif
 
+
+/* Optional: auto-clear bank config page if both banks invalid.
+ * Enable by defining AUTO_CLEAR_BANK_CFG_ON_INVALID.
+ * NOTE: Ensure SoftDevice is disabled before calling.
+ */
+#ifdef AUTO_CLEAR_BANK_CFG_ON_INVALID
+static void bank_cfg_clear(void) {
+  // Erase the single config page at SETTINGS_ADDR (aligned 4 KB)
+  // Make sure SD is disabled externally.
+  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Een << NVMC_CONFIG_WEN_Pos;
+  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) { }
+  NRF_NVMC->ERASEPAGE = SETTINGS_ADDR;
+  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) { }
+  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos;
+}
+#endif

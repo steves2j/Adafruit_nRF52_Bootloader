@@ -372,6 +372,7 @@ void bootloader_app_start(void)
     PRINTF("SoftDevice exist\r\n");
     // App starts after SoftDevice
     app_addr = SD_SIZE_GET(MBR_SIZE);
+    PRINTF("app_addr now 0x%08lX\r\n",app_addr);
     fwd_ret = sd_softdevice_vector_table_base_set(app_addr);
   }else
   {
