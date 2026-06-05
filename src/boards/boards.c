@@ -358,19 +358,41 @@ void led_pwm_duty_cycle(uint32_t led_index, uint16_t duty_cycle) {
 }
 
 static uint32_t primary_cycle_length;
+static bool primary_heartbeat;
 #ifdef LED_SECONDARY_PIN
 static uint32_t secondary_cycle_length;
 #endif
 
+static uint16_t heartbeat_duty_cycle(uint32_t millis) {
+  uint32_t const cycle = millis % 1200u;
+  uint32_t pulse = 0;
+
+  if (cycle < 140u) {
+    pulse = cycle < 70u ? cycle : 140u - cycle;
+  } else if (cycle >= 220u && cycle < 360u) {
+    uint32_t const second = cycle - 220u;
+    pulse = second < 70u ? second : 140u - second;
+  }
+
+  return (uint16_t)(0x9fu * pulse / 70u);
+}
+
 void led_tick(void) {
   uint32_t millis = _systick_count;
+  uint32_t cycle;
+  uint32_t half_cycle;
 
-  uint32_t cycle = millis % primary_cycle_length;
-  uint32_t half_cycle = primary_cycle_length / 2;
-  if (cycle > half_cycle) {
-    cycle = primary_cycle_length - cycle;
+  uint16_t duty_cycle = 0;
+  if (primary_heartbeat) {
+    duty_cycle = heartbeat_duty_cycle(millis);
+  } else {
+    cycle = millis % primary_cycle_length;
+    half_cycle = primary_cycle_length / 2;
+    if (cycle > half_cycle) {
+      cycle = primary_cycle_length - cycle;
+    }
+    duty_cycle = 0x4f * cycle / half_cycle;
   }
-  uint16_t duty_cycle = 0x4f * cycle / half_cycle;
   #if LED_STATE_ON == 1
   duty_cycle = 0xff - duty_cycle;
   #endif
@@ -396,6 +418,7 @@ static bool temp_color_active = false;
 void led_state(uint32_t state) {
   uint32_t new_rgb_color = rgb_color;
   uint32_t temp_color = 0;
+  primary_heartbeat = false;
   switch (state) {
     case STATE_USB_MOUNTED:
       new_rgb_color = 0x00ff00;
@@ -433,6 +456,14 @@ void led_state(uint32_t state) {
       secondary_cycle_length = 300;
       #else
       primary_cycle_length = 300;
+      #endif
+      break;
+
+    case STATE_BLE_HEARTBEAT:
+      new_rgb_color = 0xff00ff;
+      primary_heartbeat = true;
+      #ifdef LED_SECONDARY_PIN
+      secondary_cycle_length = 1200;
       #endif
       break;
 

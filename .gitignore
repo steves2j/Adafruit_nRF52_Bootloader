@@ -78,3 +78,5 @@ n
 nrf52840_rtt.cfg
 t
 xiao_nrf52840_ble_bootloader-0.9.2_s140_7.3.0.hex
+
+build-codex/

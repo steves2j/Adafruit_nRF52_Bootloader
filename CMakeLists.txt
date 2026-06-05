@@ -61,6 +61,7 @@ target_sources(bootloader PUBLIC
   src/dfu_init.c
   src/flash_nrf5x.c
   src/main.c
+  src/ota_swap.c
   src/screen.c
   src/images.c
   src/boards/boards.c
@@ -262,7 +263,8 @@ endif ()
 #----------------------------------
 # Get UF2 version from git
 #----------------------------------
-execute_process(COMMAND git describe --dirty --always --tags OUTPUT_VARIABLE GIT_VERSION)
+set(BOOTLOADER_VERSION_TAG "1.0.1" CACHE STRING "Base bootloader version tag")
+execute_process(COMMAND git describe --dirty --always --tags --match ${BOOTLOADER_VERSION_TAG} OUTPUT_VARIABLE GIT_VERSION)
 string(STRIP ${GIT_VERSION} GIT_VERSION)
 
 execute_process(COMMAND bash "-c" "git submodule status | cut -d\" \" -f3,4 | paste -s -d\" \" -"

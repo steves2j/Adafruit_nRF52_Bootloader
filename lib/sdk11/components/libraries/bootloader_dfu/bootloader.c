@@ -31,6 +31,7 @@
 #include "app_timer.h"
 
 #include "boards.h"
+#include "ota_swap.h"
 
 #ifdef NRF_USBD
 #include "tusb.h"
@@ -211,6 +212,8 @@ void bootloader_dfu_update_process(dfu_update_status_t update_status)
 
   if (update_status.status_code == DFU_UPDATE_APP_COMPLETE)
   {
+    (void)ota_swap_clear_pending_magic();
+
     settings.bank_0_crc  = update_status.app_crc;
     settings.bank_0_size = update_status.app_size;
     settings.bank_0      = BANK_VALID_APP;
@@ -221,6 +224,8 @@ void bootloader_dfu_update_process(dfu_update_status_t update_status)
   }
   else if (update_status.status_code == DFU_UPDATE_SD_COMPLETE)
   {
+    (void)ota_swap_clear_pending_magic();
+
     settings.bank_0_crc     = update_status.app_crc;
     settings.bank_0_size    = update_status.sd_size + update_status.bl_size + update_status.app_size;
     settings.bank_0         = BANK_VALID_SD;
@@ -235,6 +240,8 @@ void bootloader_dfu_update_process(dfu_update_status_t update_status)
   }
   else if (update_status.status_code == DFU_UPDATE_BOOT_COMPLETE)
   {
+    (void)ota_swap_clear_pending_magic();
+
     settings.bank_0         = p_bootloader_settings->bank_0;
     settings.bank_0_crc     = p_bootloader_settings->bank_0_crc;
     settings.bank_0_size    = p_bootloader_settings->bank_0_size;

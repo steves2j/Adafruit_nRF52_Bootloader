@@ -40,7 +40,8 @@ else
   LD_FILE = linker/$(MCU_SUB_VARIANT).ld
 endif
 
-GIT_VERSION := $(shell git describe --dirty --always --tags)
+BOOTLOADER_VERSION_TAG ?= 1.0.1
+GIT_VERSION := $(shell git describe --dirty --always --tags --match "$(BOOTLOADER_VERSION_TAG)")
 GIT_SUBMODULE_VERSIONS := $(shell git submodule status | cut -d" " -f3,4 | paste -s -d" " -)
 
 # compiled file name
@@ -48,6 +49,7 @@ OUT_NAME = $(BOARD)_bootloader-$(GIT_VERSION)
 
 # merged file = compiled + sd
 MERGED_FILE = $(OUT_NAME)_$(SD_NAME)_$(SD_VERSION)
+MERGED_ALIAS = $(BOARD)_bootloader_$(SD_NAME)_$(SD_VERSION).hex
 
 UF2_FAMILY_ID_BOOTLOADER = 0xd663823c
 
@@ -140,6 +142,7 @@ C_SRC += \
   src/dfu_init.c \
   src/flash_nrf5x.c \
   src/main.c \
+  src/ota_swap.c \
   src/screen.c \
   src/images.c \
 
@@ -389,10 +392,13 @@ INC_PATHS = $(addprefix -I,$(IPATH))
 # BUILD TARGETS
 #------------------------------------------------------------------------------
 
-.PHONY: all clean flash flash-dfu flash-sd flash-mbr dfu-flash sd mbr gdbflash gdb
+.PHONY: all compile clean flash flash-dfu flash-sd flash-mbr dfu-flash sd mbr gdbflash gdb
 
 # default target to build
-all: $(BUILD)/$(OUT_NAME).out $(BUILD)/$(OUT_NAME)_nosd.hex $(BUILD)/update-$(OUT_NAME)_nosd.uf2 $(BUILD)/$(MERGED_FILE).hex $(BUILD)/$(MERGED_FILE).zip
+all: $(BUILD)/$(OUT_NAME).out $(BUILD)/$(OUT_NAME)_nosd.hex $(BUILD)/update-$(OUT_NAME)_nosd.uf2 $(BUILD)/$(MERGED_FILE).hex $(BUILD)/$(MERGED_ALIAS) $(BUILD)/$(MERGED_FILE).zip
+
+# Build firmware artifacts without requiring adafruit-nrfutil ZIP packaging.
+compile: $(BUILD)/$(OUT_NAME).out $(BUILD)/$(OUT_NAME)_nosd.hex $(BUILD)/update-$(OUT_NAME)_nosd.uf2 $(BUILD)/$(MERGED_FILE).hex $(BUILD)/$(MERGED_ALIAS)
 
 # Print out the value of a make variable.
 # https://stackoverflow.com/questions/16467718/how-to-print-out-a-variable-in-makefile
@@ -450,6 +456,11 @@ $(BUILD)/update-$(OUT_NAME)_nosd.uf2: $(BUILD)/$(OUT_NAME)_nosd.hex
 $(BUILD)/$(MERGED_FILE).hex: $(BUILD)/$(OUT_NAME).hex
 	@echo Create $(notdir $@)
 	@python3 tools/hexmerge.py -o $@ $< $(SD_HEX)
+
+# Stable alias for local flash scripts.
+$(BUILD)/$(MERGED_ALIAS): $(BUILD)/$(MERGED_FILE).hex
+	@echo Create $(notdir $@)
+	@$(CP) $< $@
 
 # Create pkg zip file for bootloader+SD combo to use with DFU CDC
 $(BUILD)/$(MERGED_FILE).zip: $(BUILD)/$(OUT_NAME).hex

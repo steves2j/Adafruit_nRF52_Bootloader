@@ -68,27 +68,7 @@
 #include "nrf_sdm.h"
 #include "pstorage.h"
 #include "nrfx_nvmc.h"
-
-
-/* ----- Dual-bank selection additions ------------------------------------ */
-
-// Fixed app bank layout for XIAO nRF52840 BLE (from linker files)
-#define APP_BANK0_ADDR   (0x00027000u)
-#define APP_BANK1_ADDR   (0x00088000u)
-#define APP_BANK_SIZE    (0x00061000u)
-_Static_assert(APP_BANK0_ADDR + APP_BANK_SIZE == APP_BANK1_ADDR, "Bank layout mismatch");
-
-// Persistent bank-select page (one 4KB page right before bootloader start: 0xE9000–0xEA000)
-#define BOOTLOADER_START (0x000EA000u)
-#define BANK_CFG_PAGE_ADDR  (BOOTLOADER_START - 0x1000u)
-#define BANK_CFG_MAGIC      (0x42414E4Bu) /* 'BANK' */
-#define BANK_CFG_RESERVED   (0xFFFFFFFFu) /* Reserved fields default to erased value */
-typedef struct {
-  uint32_t magic;        // BANK_CFG_MAGIC
-  uint32_t active_bank;  // 0 or 1
-  uint32_t reserved0;    // reserved for future use
-  uint32_t reserved1;    // reserved for future use
-} bank_cfg_t;
+#include "ota_swap.h"
 
 static inline bool word_in_range(uint32_t w, uint32_t lo, uint32_t hi_exclusive) {
   return (w >= lo) && (w < hi_exclusive);
@@ -100,42 +80,10 @@ static bool app_vectors_look_sane(uint32_t app_addr) {
   uint32_t const reset = *((uint32_t const*)(app_addr + 4));
   bool ok_msp   = word_in_range(msp, 0x20000000u, 0x20040000u + 1u) && ((msp & 7u) == 0);
   if (!ok_msp) PRINTF("MSP[0x%08lX] pointer failed 0x%08lX\r\n",(unsigned long) app_addr,(unsigned long) msp);
-  bool ok_reset = word_in_range(reset & ~1u, app_addr, app_addr + APP_BANK_SIZE) && ((reset & 1u) == 1u);
+  bool ok_reset = word_in_range(reset & ~1u, app_addr, app_addr + BANK_SIZE) && ((reset & 1u) == 1u);
   if (!ok_reset) PRINTF("RESET[0x%08lX] pointer failed 0x%08lX\r\n",(unsigned long) app_addr,(unsigned long) reset);
   return ok_msp && ok_reset;
 }
-
-// Read persistent setting; return 0, 1, or -1 if unset/invalid
-static int read_active_bank_setting(void) {
-  bank_cfg_t const* cfg = (bank_cfg_t const*) BANK_CFG_PAGE_ADDR;
-  if (cfg->magic == BANK_CFG_MAGIC) {
-    return (cfg->active_bank & 1u);
-  }
-  return -1;
-}
-
-// Write active bank setting (erases the entire page first)
-static uint32_t write_active_bank_setting(uint32_t bank) {
-  if (bank > 1) return NRF_ERROR_INVALID_PARAM;
-
-  // Erase the config page
-  nrfx_nvmc_page_erase(BANK_CFG_PAGE_ADDR);
-
-  // Prepare config struct
-  bank_cfg_t cfg = {
-    .magic = BANK_CFG_MAGIC,
-    .active_bank = bank,
-    .reserved0 = BANK_CFG_RESERVED,
-    .reserved1 = BANK_CFG_RESERVED
-  };
-
-  // Write the struct (assumes page is erased)
-  nrfx_nvmc_bytes_write(BANK_CFG_PAGE_ADDR, (uint8_t*)&cfg, sizeof(cfg));
-
-  return NRF_SUCCESS;
-}
-
-/* ------------------------------------------------------------------------ */
 #ifdef NRF_USBD
 
 #include "uf2/uf2.h"
@@ -182,8 +130,10 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
 #define DFU_MAGIC_SKIP                  0x6d
 
 #define DFU_DBL_RESET_MAGIC             0x5A1AD5      // SALADS
+#define DFU_TRIPLE_RESET_MAGIC          0x5A1AD6
 #define DFU_DBL_RESET_APP               0x4ee5677e
 #define DFU_DBL_RESET_DELAY             500
+#define DFU_TRIPLE_RESET_DELAY          1500
 #define DFU_DBL_RESET_MEM               0x20007F7C
 
 #define BOOTLOADER_VERSION_REGISTER     NRF_TIMER2->CC[0]
@@ -208,6 +158,7 @@ uint32_t* dbl_reset_mem = ((uint32_t*) DFU_DBL_RESET_MEM);
 
 // true if ble, false if serial
 bool _ota_dfu = false;
+bool _triple_reset_ota_dfu = false;
 bool _ota_connected = false;
 bool _sd_inited = false;
 
@@ -260,34 +211,21 @@ int main(void) {
     led_state(STATE_WRITING_FINISHED);
   }
 
+  if (ota_swap_process()) {
+    PRINTF("OTA swap processing completed\r\n");
+  }
+
   // Check all inputs and enter DFU if needed
   // Return when DFU process is complete (or not entered at all)
   uint32_t dfuMode=check_dfu_mode();
   PRINTF("DFUMode 0x%08lX\r\n",(unsigned long)dfuMode);
-  if (!dfuMode) {
-    write_active_bank_setting(0);
-    PRINTF("Clearing active bank to 0");
-  }
 
   // Reset peripherals
   board_teardown();
 
-  int active_bank = read_active_bank_setting();
-  if (active_bank < 0) {
-    active_bank = 1;  // Default to bank 0 if unset/invalid
-    PRINTF("settings unset. Defaulting to bank 0\r\n");
-  } else {
-    PRINTF("Looking at bank %d\r\n", active_bank);
-  }
-  uint32_t want  = (active_bank ? APP_BANK1_ADDR : APP_BANK0_ADDR);
-  uint32_t other = (active_bank ? APP_BANK0_ADDR : APP_BANK1_ADDR);
-
   uint32_t app_addr = 0;
-  if (app_vectors_look_sane(want)) {
-    app_addr=want;
-    PRINTF("Using addr 0x%08lX\r\n", (unsigned long) app_addr);
-  } else if (app_vectors_look_sane(other)) {
-    app_addr=other;
+  if (app_vectors_look_sane(BANK0_ADDR)) {
+    app_addr=BANK0_ADDR;
     PRINTF("Using addr 0x%08lX\r\n", (unsigned long) app_addr);
   } else {
     PRINTF("No sane app found\r\n");
@@ -327,6 +265,7 @@ int main(void) {
 
 static uint32_t check_dfu_mode(void) {
   uint32_t const gpregret = NRF_POWER->GPREGRET;
+  uint32_t const reset_marker = *dbl_reset_mem;
   uint32_t rtnValue = 0xff;
   // SD is already Initialized in case of BOOTLOADER_DFU_OTA_MAGIC
   _sd_inited = (gpregret == DFU_MAGIC_OTA_APPJUM);
@@ -340,10 +279,14 @@ static uint32_t check_dfu_mode(void) {
   bool const dfu_skip        = (gpregret == DFU_MAGIC_SKIP);
 
   bool const reason_reset_pin = (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) ? true : false;
+  bool const double_reset = (reset_marker == DFU_DBL_RESET_MAGIC) && reason_reset_pin;
+  bool const triple_reset = (reset_marker == DFU_TRIPLE_RESET_MAGIC) && reason_reset_pin;
+  _triple_reset_ota_dfu = triple_reset;
+  _ota_dfu = _ota_dfu || triple_reset;
 
   // start either serial, uf2 or ble
   bool dfu_start = _ota_dfu || serial_only_dfu || uf2_dfu ||
-                   (((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin);
+                   double_reset || triple_reset;
 
   // Clear GPREGRET if it is our values
   if (dfu_start || dfu_skip) NRF_POWER->GPREGRET = 0;
@@ -358,7 +301,7 @@ static uint32_t check_dfu_mode(void) {
   // DFU + FRESET are pressed --> OTA
   _ota_dfu = _ota_dfu || (button_pressed(BUTTON_DFU) && button_pressed(BUTTON_FRESET));
 
-  bool const valid_app = bootloader_app_is_valid();
+  bool const valid_app = bootloader_app_is_valid() || app_vectors_look_sane(BANK0_ADDR);
   bool const just_start_app = valid_app && !dfu_start && (*dbl_reset_mem) == DFU_DBL_RESET_APP;
 
   if (!just_start_app && APP_ASKS_FOR_SINGLE_TAP_RESET()) dfu_start = 1;
@@ -384,6 +327,12 @@ static uint32_t check_dfu_mode(void) {
 #endif
   }
 
+  if (double_reset && !_ota_dfu) {
+    led_state(STATE_BLE_HEARTBEAT);
+    (*dbl_reset_mem) = DFU_TRIPLE_RESET_MAGIC;
+    NRFX_DELAY_MS(DFU_TRIPLE_RESET_DELAY);
+  }
+
   if (APP_ASKS_FOR_SINGLE_TAP_RESET()) {
     (*dbl_reset_mem) = DFU_DBL_RESET_APP;
   } else {
@@ -393,7 +342,7 @@ static uint32_t check_dfu_mode(void) {
   // Enter DFU mode accordingly to input
   if (dfu_start || !valid_app) {
     if (_ota_dfu) {
-      led_state(STATE_BLE_DISCONNECTED);
+      led_state(_triple_reset_ota_dfu ? STATE_BLE_HEARTBEAT : STATE_BLE_DISCONNECTED);
       if (!_sd_inited) mbr_init_sd();
       _sd_inited = true;
       ble_stack_init();
@@ -465,7 +414,13 @@ static uint32_t ble_stack_init(void) {
   blecfg.conn_cfg.params.gatt_conn_cfg.att_mtu = BLEGATT_ATT_MTU_MAX;
   sd_ble_cfg_set(BLE_CONN_CFG_GATT, &blecfg, ram_start);
 
-  // Event Length + HVN queue + WRITE CMD queue setting affecting bandwidth
+  // Handle-value notification queue for DFU responses and packet receipt notifications.
+  varclr(&blecfg);
+  blecfg.conn_cfg.conn_cfg_tag = BLE_CONN_CFG_HIGH_BANDWIDTH;
+  blecfg.conn_cfg.params.gatts_conn_cfg.hvn_tx_queue_size = 4;
+  sd_ble_cfg_set(BLE_CONN_CFG_GATTS, &blecfg, ram_start);
+
+  // Event Length setting affecting bandwidth
   varclr(&blecfg);
   blecfg.conn_cfg.conn_cfg_tag = BLE_CONN_CFG_HIGH_BANDWIDTH;
   blecfg.conn_cfg.params.gap_conn_cfg.conn_count = 1;
@@ -525,7 +480,7 @@ uint32_t proc_ble(void) {
 
       case BLE_GAP_EVT_DISCONNECTED:
         _ota_connected = false;
-        led_state(STATE_BLE_DISCONNECTED);
+        led_state(_triple_reset_ota_dfu ? STATE_BLE_HEARTBEAT : STATE_BLE_DISCONNECTED);
         break;
 
       default:
@@ -588,21 +543,4 @@ __attribute__ ((used)) int _write (int fhdl, const void *buf, size_t count) {
   return count;
 }
 
-#endif
-
-
-/* Optional: auto-clear bank config page if both banks invalid.
- * Enable by defining AUTO_CLEAR_BANK_CFG_ON_INVALID.
- * NOTE: Ensure SoftDevice is disabled before calling.
- */
-#ifdef AUTO_CLEAR_BANK_CFG_ON_INVALID
-static void bank_cfg_clear(void) {
-  // Erase the single config page at SETTINGS_ADDR (aligned 4 KB)
-  // Make sure SD is disabled externally.
-  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Een << NVMC_CONFIG_WEN_Pos;
-  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) { }
-  NRF_NVMC->ERASEPAGE = SETTINGS_ADDR;
-  while (NRF_NVMC->READY == NVMC_READY_READY_Busy) { }
-  NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos;
-}
 #endif
